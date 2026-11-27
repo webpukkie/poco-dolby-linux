@@ -1,0 +1,8 @@
+stage/
+probe
+pipewire/dolbyd
+pipewire/dolby-rpc-client
+pipewire/pw-dolby
+*.o
+qemu.out
+extra_stubs.so
