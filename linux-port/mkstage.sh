@@ -9,6 +9,8 @@ SRC="${1:-.}"
 OUT="${2:-stage}"
 CC="${3:-aarch64-linux-gnu-gcc}"
 SYS="${4:-}"
+SYSARG=""
+[ -n "$SYS" ] && SYSARG="--sysroot=$SYS"
 if [ -n "$SYS" ]; then
     CPP="$SYS/usr/aarch64-linux-gnu/lib"      # glibc for arm64
 else
@@ -31,6 +33,19 @@ fi
 mkdir -p "$OUT"
 cd "$OUT"
 
+# Sysroot-safe libc.so linker script: some cross-glibc installs (e.g. Arch's
+# aarch64-linux-gnu-glibc) ship a libc.so script with absolute /lib/ paths,
+# which break when the compiler is used without --sysroot.  Point -lc
+# straight at the real target files instead.
+CPPA=$(cd "$CPP" && pwd)
+mkdir -p lnk
+{
+    printf 'GROUP ( %s/libc.so.6' "$CPPA"
+    if [ -f "$CPP/libc_nonshared.a" ]; then printf ' %s/libc_nonshared.a' "$CPPA"; fi
+    if [ -f "$CPP/ld-linux-aarch64.so.1" ]; then printf ' AS_NEEDED ( %s/ld-linux-aarch64.so.1 )' "$CPPA"; fi
+    printf ' )\n'
+} > lnk/libc.so
+
 # tell gen_stubs.py where the target glibc and libc++ live, so it does not
 # emit stubs for symbols the real libraries provide
 export CPPLIB="$CPP"
@@ -39,7 +54,7 @@ python3 ../gen_stubs.py "$SRC"
 
 STUBS="liblog libutils libcutils libaudioutils libhidlbase libstagefright_foundation libxml2 vendor.dolby.hardware.dms@2.0"
 for s in $STUBS; do
-    $CC --sysroot="$SYS" -O2 -fPIC -shared -Wl,-soname,"$s.so" -o "$s.so" stub_auto.c
+    $CC $SYSARG -O2 -fPIC -shared -L"$PWD/lnk" -Wl,-soname,"$s.so" -o "$s.so" stub_auto.c
 done
 
 for lib in libswdap libdapparamstorage libdlbpreg libspatializerparamstorage; do

@@ -48,11 +48,11 @@ SYSARG=""
 cd "$DIR"
 sh mkstage.sh "$DIR/../binaries/arm64" stage "$CC" "$SYS"
 
-$CC $SYSARG -O2 -fPIC -shared -o stage/extra_stubs.so extra_stubs.c
+$CC $SYSARG -O2 -fPIC -shared -L"$DIR/stage/lnk" -o stage/extra_stubs.so extra_stubs.c
 
 $CC $SYSARG -O1 -o probe probe.c dap_effect.c apply_packed.c \
-    -Wl,-rpath,"$DIR/stage" -L"$DIR/stage" -ldl -lm
+    -Wl,-rpath,"$DIR/stage" -L"$DIR/stage" -L"$DIR/stage/lnk" -ldl -lm
 
 $CC $SYSARG -O1 -o pipewire/dolbyd pipewire/dolbyd.c dap_effect.c apply_packed.c \
-    -Wl,-rpath,"$DIR/stage" -L"$DIR/stage" -ldl -lm
+    -Wl,-rpath,"$DIR/stage" -L"$DIR/stage" -L"$DIR/stage/lnk" -ldl -lm
 echo "built ./probe, pipewire/dolbyd and ./stage"
