@@ -140,35 +140,37 @@ with default tuning).
 
 ## 7. Live in the PipeWire graph
 
-Build the native filter node (links against your system PipeWire):
+Build the PipeWire node (links against your system PipeWire):
 
 ```sh
 ./pipewire/build-pw.sh
 ./pipewire/run-pw-dolby.sh             # starts dolbyd + pw-dolby
 ```
 
-This creates a filter node named `dolby_atmos` with mono ports
-`input_FL/FR` and `output_FL/FR` (up to 8 channels; f32 at 48 kHz, 256-frame
-engine blocks by default — the DAP engine runs s16 internally, conversion is
-handled by the node). The node rate must match your PipeWire graph rate
-(check `pw-metadata -n settings | grep clock.rate`, default 48000; pass
-`--rate` if you changed it), or links will fail to negotiate. Route audio
-through it with `pw-link`:
+This creates a **virtual sink** named `dolby_atmos` that shows up as
+"Dolby Atmos (DAP)" in your desktop's audio settings and in `wpctl status`
+under Sinks. No `pw-link` wiring is needed: everything routed to this sink
+is processed by the DAP engine and played back on your real output device
+(automatically detected — the sink that was default before `dolby_atmos`
+started; override with `DOLBY_SINK=<sink-name> ./pipewire/run-pw-dolby.sh`).
+
+Make it your default output and play something:
 
 ```sh
-pw-link -oi | head -30                 # list output ports of all nodes
-pw-link <player-output-port> dolby_atmos:input_FL
-pw-link <player-output-port> dolby_atmos:input_FR
-pw-link dolby_atmos:output_FL <sink>:playback_FL
-pw-link dolby_atmos:output_FR <sink>:playback_FR
+wpctl status                 # find the dolby_atmos node id under Sinks, e.g. 123
+wpctl set-default 123
+# or pick "Dolby Atmos (DAP)" in your desktop audio settings / pavucontrol
 ```
 
-List port names with `pw-link -oi` (outputs of all nodes) and `-ii`. A
-graphical patchbay (`qpwgraph`, `helvum`) makes the same connections with
-drag & drop. To make it semi-permanent, point players at `dolby_atmos` or
-use a loopback/patchbay profile — the node advertises
-`media.type=Audio, media.category=Filter, media.role=DSP`, so
-`pw-dump | grep dolby` shows its current links.
+To chain into an existing DSP (e.g. LiteFX manages its own virtual-sink
+chain): `DOLBY_SINK=litefx_sink ./pipewire/run-pw-dolby.sh` — the Dolby
+output then feeds LiteFX's sink instead of the hardware.
+
+The node runs at 48 kHz with 256-frame engine blocks by default; the DAP
+engine takes s16 internally (conversion and resampling are handled by the
+PipeWire stream converters, so apps at other rates/formats are fine).
+Match `--rate` to your graph rate for best quality
+(`pw-metadata -n settings | grep clock.rate`, default 48000).
 
 `run-pw-dolby.sh` passes extra flags through: `--rate 44100 --frames 1024
 --socket /tmp/my.sock --name my_dolby` all work (raise `--frames` if you get
@@ -185,10 +187,18 @@ dropouts; 1024 doubles the per-block time budget).
 - **Socket already in use / daemon won't start:** one connection at a time;
   `rm -f /tmp/dolbyd.sock` and make sure no old daemon lingers:
   `pkill -x qemu-aarch64` (kill by exact process name — never `pkill -f`).
-- **Links fail with `failed to link ports`** — almost always a rate or
-  format mismatch: the node's `--rate` must equal the PipeWire graph rate
-  (`pw-metadata -n settings | grep clock.rate`). Links also die whenever the
-  node restarts — re-link after restarting `run-pw-dolby.sh`.
+- **Links fail with `failed to link ports`** — no longer applies: the
+  virtual-sink design needs no manual links. If you still run an older
+  filter-node build, upgrade to the current branch.
+- **No sound, but `wpctl status` shows the Dolby sink and a `dolby_atmos_output`
+  stream** — check the stream's target: `pw-cli info` on the output stream's
+  node id; if it is linked to the wrong device, restart with
+  `DOLBY_SINK=<sink-name> ./pipewire/run-pw-dolby.sh`.
+- **Feedback loop / echo** — never set `--sink` to the Dolby sink itself;
+  the script caches the last real device in `~/.cache/dolby-linux-sink` to
+  avoid this after restarts.
+- **Silence at start for ~10 ms** — the output stream primes two engine
+  blocks before emitting, to avoid crackle from pipeline jitter.
 - **Crackling/dropouts in the live node:** the qemu round-trip costs ~1 ms
   per 256-frame block; raise `--frames` to 512/1024, and keep the machine
   out of deep powersave.

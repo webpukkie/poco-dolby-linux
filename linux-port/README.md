@@ -21,7 +21,7 @@ Working (verified, see `docs/RE-notes.md` for the full analysis):
       zero crashes, no library modifications
 - [x] The `-ENOSYS` (-38) deadlock root-caused and fixed (pregain/crossfade
       priming, see `docs/RE-notes.md`)
-- [x] PipeWire filter node (`pipewire/pw-dolby`) + RPC daemon
+- [x] PipeWire virtual sink (`pipewire/pw-dolby`) + RPC daemon
       (`pipewire/dolbyd`): audio flows from a PipeWire graph through the real
       DAP engine and back; ~10× realtime headroom under qemu (measured:
       509 ms CPU for 5.12 s of 48 kHz stereo)
@@ -57,30 +57,25 @@ stream shows the whole internal pipeline (`DlbDlbBufferAdapter`,
 ## Using it as a PipeWire effect
 
 Architecture: the aarch64 Dolby libs run in `dolbyd` (a small RPC daemon,
-under `qemu-aarch64`), and a native PipeWire filter node
-(`pipewire/pw-dolby`) sits in the audio graph and shuttles PCM blocks to it
-over a Unix socket.
+under `qemu-aarch64`), and a native PipeWire virtual sink (`pipewire/pw-dolby`)
+shuttles PCM blocks to it over a Unix socket and plays the result on your
+real output device.
 
 ```sh
 cd pipewire && PW_PREFIX=<pipewire-prefix> ./build-pw.sh   # or plain ./build-pw.sh for system PipeWire
 cd ..
-./pipewire/run-pw-dolby.sh                 # starts dolbyd + the filter node
+./pipewire/run-pw-dolby.sh                 # starts dolbyd + the virtual sink
 ```
 
-Then route audio into the node, e.g. with pw-link:
-
-```sh
-pw-link <source-output_FL> dolby_atmos:input_FL
-pw-link <source-output_FR> dolby_atmos:input_FR
-pw-link dolby_atmos:output_FL <sink-playback_FL>
-pw-link dolby_atmos:output_FR <sink-playback_FR>
-```
-
-or set `dolby_atmos` as the DSP/target device in your player.  The ports are
+Then select the **"Dolby Atmos (DAP)"** sink as your output device (desktop
+audio settings / pavucontrol, or `wpctl set-default <id>`) — no `pw-link`
+wiring is needed.  Everything played into it is processed by the DAP engine
+and played on your real output device (auto-detected, or force it with
+`DOLBY_SINK=<sink-name> ./pipewire/run-pw-dolby.sh`; use e.g.
+`DOLBY_SINK=litefx_sink` to chain into an existing DSP).  The streams are
 f32 at 48 kHz stereo by default (the DAP engine runs s16 internally;
-`--rate/--channels/--frames/--socket/--name` to change).  The node's rate
-must match the PipeWire graph rate (`pw-metadata -n settings | grep
-clock.rate`, default 48000) or links will fail to negotiate.
+`--rate/--frames/--socket/--name` to change — PipeWire's stream converters
+handle every app format and rate).
 
 Without a running session you can still exercise the exact same data path
 from the command line (raw s16le PCM on stdin/stdout):
@@ -116,7 +111,7 @@ latency.  Known engine quirks: the input block is clobbered by `process()`
 | `run-daemon.sh` | run `pipewire/dolbyd` under qemu with the property env vars |
 | `pipewire/dolbyd.c` | RPC daemon: drives the DAP, serves PCM blocks over a Unix socket |
 | `pipewire/dolby-rpc-client.c` | native test client (stdin PCM -> daemon -> stdout) |
-| `pipewire/pw-dolby.c` | native PipeWire filter node (pw_filter API, s16, 1..8 ch) |
+| `pipewire/pw-dolby.c` | native PipeWire virtual sink (pw_stream API, f32↔s16, stereo) |
 | `pipewire/build-pw.sh`, `pipewire/run-pw-dolby.sh` | build the native side / launch daemon + node |
 | `tools/rsp.py` | minimal GDB RSP client for `qemu-aarch64 -g` |
 | `tools/dbg7.py` | breakpoint tracer used to root-cause the -38 (see RE-notes) |
@@ -131,13 +126,17 @@ design:
    relocations, creates the effect (uuid from `configs/audio_effects.xml`)
    and sends the INIT/SET_CONFIG/SET_DEVICE/SET_AUDIO_MODE/gain-sync/ENABLE
    sequence.
-2. **Graph:** `input stream → dolby_atmos filter node → output/sink`.  The
-   node claims the format it configures the effect with (s16, 48 kHz
-   default, 256-frame quantum — the engine's native block size at 48 kHz;
-   PipeWire resamples otherwise).
-3. **Buffers:** `pw-dolby` interleaves the per-channel planes into a scratch
-   block (the input buffer gets clobbered once the crossfade is active,
-   see RE-notes) and writes the processed result back to the output planes.
+2. **Graph:** `apps → dolby_atmos virtual sink (pw_stream, media.class
+   Audio/Sink) → DAP engine → dolby_atmos_output playback stream → real
+   sink`.  WirePlumber links the output stream to the device that was
+   default at startup (or `--sink`), so no manual wiring is needed.  The
+   streams advertise f32 / 48 kHz / stereo (the engine's s16 native block
+   is 256 frames at 48 kHz; the server-side converters convert/resample).
+3. **Buffers:** `pw-dolby` converts f32→s16 interleaved into a FIFO, pushes
+   whole 256-frame blocks through the daemon (the input buffer gets
+   clobbered once the crossfade is active, see RE-notes) and drains a
+   second FIFO into the playback stream, primed two blocks deep to avoid
+   crackle from pipeline jitter.
 4. **Emulation:** the aarch64 libs run in `dolbyd` under `qemu-aarch64`
    while the PipeWire node stays native; on an arm64 host `dolbyd` runs
    natively with no qemu.  For a native x86_64 setup, extract the x86_64
