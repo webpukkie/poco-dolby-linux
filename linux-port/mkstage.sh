@@ -31,6 +31,10 @@ fi
 mkdir -p "$OUT"
 cd "$OUT"
 
+# tell gen_stubs.py where the target glibc and libc++ live, so it does not
+# emit stubs for symbols the real libraries provide
+export CPPLIB="$CPP"
+export CXXLIB="$CXXROOT/usr/lib/aarch64-linux-gnu"
 python3 ../gen_stubs.py "$SRC"
 
 STUBS="liblog libutils libcutils libaudioutils libhidlbase libstagefright_foundation libxml2 vendor.dolby.hardware.dms@2.0"

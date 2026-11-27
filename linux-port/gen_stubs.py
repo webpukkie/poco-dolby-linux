@@ -26,16 +26,53 @@ for lib in LIBS:
             defined.add(name)
 
 skip = set()
-for root, sos in [('/tmp/crossroot/usr/aarch64-linux-gnu/lib',
-                   ['libc.so.6','libm.so.6','libdl.so.2','libpthread.so.0','librt.so.1']),
-                  ('/tmp/crossroot-arm64/usr/lib/aarch64-linux-gnu',
-                   ['libc++.so.1','libc++abi.so.1','libunwind.so.8'])]:
+LIBC_SOS = ['libc.so.6','libm.so.6','libdl.so.2','libpthread.so.0','librt.so.1']
+CXX_SOS = ['libc++.so.1','libc++abi.so.1','libunwind.so.8']
+roots = []
+if os.environ.get('CPPLIB'): roots.append((os.environ['CPPLIB'], LIBC_SOS))
+if os.environ.get('CXXLIB'): roots.append((os.environ['CXXLIB'], CXX_SOS))
+roots += [('/tmp/crossroot/usr/aarch64-linux-gnu/lib', LIBC_SOS),
+          ('/tmp/crossroot-arm64/usr/lib/aarch64-linux-gnu', CXX_SOS),
+          ('/usr/aarch64-linux-gnu/lib', LIBC_SOS),
+          ('/usr/lib/aarch64-linux-gnu', CXX_SOS)]
+seen = set()
+for root, sos in roots:
+    if root in seen or not os.path.isdir(root): continue
+    seen.add(root)
     for so in sos:
         p = os.path.join(root, so)
         if os.path.exists(p):
             for ndx, name, typ, size in symbols(p):
                 if name: skip.add(name)
 skip |= {'_Unwind_Resume','_Unwind_Complete','__gnu_unwind_frame'}
+# Standard C library symbols resolve from the real libc/libm at runtime;
+# never emit no-op stubs for them (conflicts with glibc headers on newer
+# compilers, and a no-op malloc/strcmp would be actively wrong).
+skip |= set('''
+abort abs asinf atan2f atanf atexit atof atoi atol atoll bsearch calloc ceilf
+cosf coshf dladdr dlclose dlerror dlopen dlsym exit expf fabsf fclose fdopen
+feof ferror fflush fgetc fgetpos fgets floorf fmodf fopen fprintf fputc fputs
+fread free frexpf fscanf fseek fsetpos ftell fwrite getc getenv ldexpf log10f
+logf malloc memcmp memcpy memmove memset powf printf putc putchar puts qsort
+raise rand realloc remove rename rewind roundf scanf setbuf setvbuf sinf sinhf
+snprintf sprintf sqrtf srand sscanf strcat strchr strcmp strcoll strcpy
+strcspn strerror strlen strncat strncmp strncpy strpbrk strrchr strspn strstr
+strtod strtof strtok strtol strtold strtoll strtoul strtoull strxfrm tanf
+tanhf truncf ungetc vfprintf vprintf vsnprintf vsprintf
+__snprintf_chk __sprintf_chk __vsprintf_chk __vsnprintf_chk __memcpy_chk
+__memmove_chk __memset_chk __strcpy_chk __strcat_chk __strlen_chk
+pthread_attr_destroy pthread_attr_init pthread_attr_setdetachstate
+pthread_cond_broadcast pthread_cond_destroy pthread_cond_init
+pthread_cond_signal pthread_cond_timedwait pthread_cond_wait
+pthread_condattr_destroy pthread_condattr_init pthread_condattr_setclock
+pthread_create pthread_detach pthread_equal pthread_exit pthread_getspecific
+pthread_join pthread_key_create pthread_key_delete pthread_mutex_destroy
+pthread_mutex_init pthread_mutex_lock pthread_mutex_trylock pthread_mutex_unlock
+pthread_mutexattr_destroy pthread_mutexattr_init pthread_mutexattr_settype
+pthread_once pthread_rwlock_destroy pthread_rwlock_rdlock pthread_rwlock_unlock
+pthread_rwlock_wrlock pthread_rwlockattr_destroy pthread_rwlockattr_init
+pthread_self pthread_setspecific
+'''.split())
 
 todo = {n:t for n,t in und.items() if n not in defined and n not in skip and not n.startswith('_ITM')}
 funcs = sorted(n for n,(t,s) in todo.items() if t != 'OBJECT')
