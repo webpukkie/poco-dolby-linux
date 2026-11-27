@@ -37,9 +37,12 @@ Not done yet:
 
 ## Quick start
 
-Needs: `qemu-user` (aarch64), an aarch64 cross GCC + sysroot, and an aarch64
-LLVM libc++/libunwind (the Dolby libs are linked against libc++).  See
-`build.sh` for the expected env vars (`CC`, `SYSROOT`, `CXXROOT`).
+Full step-by-step walkthrough for an x86_64 desktop (Arch Linux and friends):
+**[guide.md](guide.md)** — packages, toolchain prefix, build, probe, CLI
+filter, live PipeWire graph, troubleshooting.
+
+Short version: run `./setup-toolchain.sh` once (fetches the aarch64 LLVM
+libc++/libunwind the Dolby libs need), then:
 
 ```sh
 ./build.sh        # builds ./stage (stubs + deversioned libs) and ./probe
