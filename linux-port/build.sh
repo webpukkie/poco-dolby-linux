@@ -32,6 +32,9 @@ sh mkstage.sh "$DIR/../binaries/arm64" stage "$CC" "$SYS"
 
 $CC --sysroot="$SYS" -O2 -fPIC -shared -o stage/extra_stubs.so extra_stubs.c
 
-$CC --sysroot="$SYS" -O1 -o probe probe.c apply_packed.c \
+$CC --sysroot="$SYS" -O1 -o probe probe.c dap_effect.c apply_packed.c \
     -Wl,-rpath,"$DIR/stage" -L"$DIR/stage" -ldl -lm
-echo "built ./probe and ./stage"
+
+$CC --sysroot="$SYS" -O1 -o pipewire/dolbyd pipewire/dolbyd.c dap_effect.c apply_packed.c \
+    -Wl,-rpath,"$DIR/stage" -L"$DIR/stage" -ldl -lm
+echo "built ./probe, pipewire/dolbyd and ./stage"

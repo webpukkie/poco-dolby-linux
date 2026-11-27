@@ -21,10 +21,13 @@ Working (verified, see `docs/RE-notes.md` for the full analysis):
       zero crashes, no library modifications
 - [x] The `-ENOSYS` (-38) deadlock root-caused and fixed (pregain/crossfade
       priming, see `docs/RE-notes.md`)
+- [x] PipeWire filter node (`pipewire/pw-dolby`) + RPC daemon
+      (`pipewire/dolbyd`): audio flows from a PipeWire graph through the real
+      DAP engine and back; ~10× realtime headroom under qemu (measured:
+      509 ms CPU for 5.12 s of 48 kHz stereo)
 
 Not done yet:
 
-- [ ] PipeWire filter node integration (design below)
 - [ ] Runtime parameter control from the host (the DAP parameter list via
       `DapEffectContext::setParamValues`, param 0x00)
 - [ ] Formats beyond s16 stereo (float32, multichannel), rate changes at runtime
@@ -48,45 +51,94 @@ and `DONE blocks=50 failures=0`.  With `LOGLEVEL=7` the library's own log
 stream shows the whole internal pipeline (`DlbDlbBufferAdapter`,
 `DlbDap2Process`, `DlbCrossfadeProcess` state transitions).
 
+## Using it as a PipeWire effect
+
+Architecture: the aarch64 Dolby libs run in `dolbyd` (a small RPC daemon,
+under `qemu-aarch64`), and a native PipeWire filter node
+(`pipewire/pw-dolby`) sits in the audio graph and shuttles PCM blocks to it
+over a Unix socket.
+
+```sh
+cd pipewire && PW_PREFIX=<pipewire-prefix> ./build-pw.sh   # or plain ./build-pw.sh for system PipeWire
+cd ..
+./pipewire/run-pw-dolby.sh                 # starts dolbyd + the filter node
+```
+
+Then route audio into the node, e.g. with pw-link:
+
+```sh
+pw-link <source-output_FL> dolby_atmos:input_FL
+pw-link <source-output_FR> dolby_atmos:input_FR
+pw-link dolby_atmos:output_FL <sink-playback_FL>
+pw-link dolby_atmos:output_FR <sink-playback_FR>
+```
+
+or set `dolby_atmos` as the DSP/target device in your player.  The node is
+s16, 48 kHz stereo by default (`--rate/--channels/--frames/--socket/--name`
+to change); PipeWire resamples the graph to match.
+
+Without a running session you can still exercise the exact same data path
+from the command line (raw s16le PCM on stdin/stdout):
+
+```sh
+./run-daemon.sh &
+ffmpeg -i in.wav -f s16le -ar 48000 -ac 2 - | \
+    pipewire/dolby-rpc-client 48000 2 512 > out.raw
+ffmpeg -f s16le -ar 48000 -ac 2 -i out.raw out.wav
+```
+
+Latency: one graph quantum of DSP delay (~23 ms at 48 kHz, inherent to the
+effect) plus the RPC round-trip.  The daemon side costs ~1 ms per 512-frame
+block under qemu (10× realtime headroom on a modern x86_64 core), so the
+blocking RPC inside `on_process()` is acceptable for a desktop demo; run
+`dolbyd` natively on arm64 (same binary, no qemu) for production-grade
+latency.  Known engine quirks: the input block is clobbered by `process()`
+(handled by the scratch copy in both frontends) and `GET_CONFIG` needs
+`cmdSize >= 112` (see `docs/RE-notes.md`).
+
 ## Layout
 
 | file | purpose |
 |------|---------|
-| `probe.c` | drives libswdap through the AOSP effect interface (create/command/process) |
+| `probe.c` | self-test: synthetic tone through the full effect interface |
+| `dap_effect.c/.h` | reusable wrapper: engine load + effect lifecycle + process |
 | `aosp_effect_abi.h` | minimal AOSP audio-effect ABI structs (64-bit Android layout) |
 | `apply_packed.c/.h` | applies the APS2 packed relocations at runtime after dlopen |
 | `deversion.py` | strips Android symbol versioning so glibc can load the libs |
 | `gen_stubs.py`, `extra_stubs.c` | generate + hand-fix the Android platform stub libs (`stub_auto.c` is generated into `stage/`) |
-| `mkstage.sh`, `build.sh` | assemble `stage/` and build the probe |
+| `mkstage.sh`, `build.sh` | assemble `stage/` and build the probe + daemon |
 | `run-probe.sh` | qemu-aarch64 invocation with the Android property env vars |
+| `run-daemon.sh` | run `pipewire/dolbyd` under qemu with the property env vars |
+| `pipewire/dolbyd.c` | RPC daemon: drives the DAP, serves PCM blocks over a Unix socket |
+| `pipewire/dolby-rpc-client.c` | native test client (stdin PCM -> daemon -> stdout) |
+| `pipewire/pw-dolby.c` | native PipeWire filter node (pw_filter API, s16, 1..8 ch) |
+| `pipewire/build-pw.sh`, `pipewire/run-pw-dolby.sh` | build the native side / launch daemon + node |
 | `tools/rsp.py` | minimal GDB RSP client for `qemu-aarch64 -g` |
 | `tools/dbg7.py` | breakpoint tracer used to root-cause the -38 (see RE-notes) |
 | `docs/RE-notes.md` | the full reverse-engineering reference |
 
-## PipeWire integration design (next step)
+## PipeWire integration notes
 
-The library is a drop-in AOSP effect: one `create`, a handful of commands,
-and a per-block `process(in, out)` with the block-size constraint from
-`docs/RE-notes.md`.  A PipeWire filter node (SPA "audiofilter" style, or a
-`pipewire-filter` module node) can wrap it:
+Implemented (see "Using it as a PipeWire effect" above), following this
+design:
 
-1. **Loader:** dlopen `stage/libswdap.so`, apply packed relocations, create
-   the effect once (uuid from `configs/audio_effects.xml`), send the
-   INIT/SET_CONFIG/SET_DEVICE/SET_AUDIO_MODE/gain-sync/ENABLE sequence from
-   `probe.c`.
-2. **Graph:** `input stream → dolby filter node → output/sink`.  The node
-   claims the same format it configures the effect with (start with s16
-   stereo 48 kHz, 256-frame quantum — the engine's native block size at
-   48 kHz; resample in PipeWire otherwise).
-3. **Buffers:** feed `process()` from the SPA buffer; the input buffer gets
-   clobbered once the crossfade is active, so copy the input into a scratch
-   block first (see RE-notes).
-4. **Emulation:** the aarch64 libs currently require `qemu-aarch64` (the
-   whole node can run under `qemu-aarch64` + PipeWire, or the effect can be
-   wrapped in a small aarch64 RPC shim driven by a native PipeWire node).
-   For a native x86_64 setup, extract the x86_64 Dolby libs from an
-   x86_64 Android image and repeat the same harness (the stubs and the
-   relocation applier are already architecture-independent).
+1. **Loader:** `dap_effect.c` dlopens `stage/libswdap.so`, applies packed
+   relocations, creates the effect (uuid from `configs/audio_effects.xml`)
+   and sends the INIT/SET_CONFIG/SET_DEVICE/SET_AUDIO_MODE/gain-sync/ENABLE
+   sequence.
+2. **Graph:** `input stream → dolby_atmos filter node → output/sink`.  The
+   node claims the format it configures the effect with (s16, 48 kHz
+   default, 256-frame quantum — the engine's native block size at 48 kHz;
+   PipeWire resamples otherwise).
+3. **Buffers:** `pw-dolby` interleaves the per-channel planes into a scratch
+   block (the input buffer gets clobbered once the crossfade is active,
+   see RE-notes) and writes the processed result back to the output planes.
+4. **Emulation:** the aarch64 libs run in `dolbyd` under `qemu-aarch64`
+   while the PipeWire node stays native; on an arm64 host `dolbyd` runs
+   natively with no qemu.  For a native x86_64 setup, extract the x86_64
+   Dolby libs from an x86_64 Android image and repeat the same harness (the
+   stubs and the relocation applier are architecture-independent).
 5. **Control:** map PipeWire/ALSA-volume changes to DAP params once
    `setParamValues` (param 0x00) is understood; see RE-notes for the
-   parser entry points.
+   parser entry points.  (Not implemented yet; ENABLE/DISABLE already is,
+   via RPC cmds 2/3.)
