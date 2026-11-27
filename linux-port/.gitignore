@@ -1,0 +1,5 @@
+stage/
+probe
+*.o
+qemu.out
+extra_stubs.so
