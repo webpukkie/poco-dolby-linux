@@ -76,9 +76,11 @@ pw-link dolby_atmos:output_FL <sink-playback_FL>
 pw-link dolby_atmos:output_FR <sink-playback_FR>
 ```
 
-or set `dolby_atmos` as the DSP/target device in your player.  The node is
-s16, 48 kHz stereo by default (`--rate/--channels/--frames/--socket/--name`
-to change); PipeWire resamples the graph to match.
+or set `dolby_atmos` as the DSP/target device in your player.  The ports are
+f32 at 48 kHz stereo by default (the DAP engine runs s16 internally;
+`--rate/--channels/--frames/--socket/--name` to change).  The node's rate
+must match the PipeWire graph rate (`pw-metadata -n settings | grep
+clock.rate`, default 48000) or links will fail to negotiate.
 
 Without a running session you can still exercise the exact same data path
 from the command line (raw s16le PCM on stdin/stdout):

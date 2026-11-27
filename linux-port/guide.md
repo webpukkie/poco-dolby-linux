@@ -148,8 +148,12 @@ Build the native filter node (links against your system PipeWire):
 ```
 
 This creates a filter node named `dolby_atmos` with mono ports
-`input_FL/FR` and `output_FL/FR` (up to 8 channels; s16, 48 kHz, 512-frame
-blocks by default). Route audio through it with `pw-link`:
+`input_FL/FR` and `output_FL/FR` (up to 8 channels; f32 at 48 kHz, 256-frame
+engine blocks by default — the DAP engine runs s16 internally, conversion is
+handled by the node). The node rate must match your PipeWire graph rate
+(check `pw-metadata -n settings | grep clock.rate`, default 48000; pass
+`--rate` if you changed it), or links will fail to negotiate. Route audio
+through it with `pw-link`:
 
 ```sh
 pw-link -oi | head -30                 # list output ports of all nodes
@@ -181,9 +185,13 @@ dropouts; 1024 doubles the per-block time budget).
 - **Socket already in use / daemon won't start:** one connection at a time;
   `rm -f /tmp/dolbyd.sock` and make sure no old daemon lingers:
   `pkill -x qemu-aarch64` (kill by exact process name — never `pkill -f`).
+- **Links fail with `failed to link ports`** — almost always a rate or
+  format mismatch: the node's `--rate` must equal the PipeWire graph rate
+  (`pw-metadata -n settings | grep clock.rate`). Links also die whenever the
+  node restarts — re-link after restarting `run-pw-dolby.sh`.
 - **Crackling/dropouts in the live node:** the qemu round-trip costs ~1 ms
-  per 512-frame block; raise `--frames` to 1024, and keep the machine out of
-  deep powersave.
+  per 256-frame block; raise `--frames` to 512/1024, and keep the machine
+  out of deep powersave.
 - **Latency:** ~23 ms engine delay + one block of buffering (512 frames =
   10.7 ms at 48 kHz). This is inherent to the phone's audio path.
 - **`mkstage.sh: cannot locate aarch64 glibc`** — your cross gcc is

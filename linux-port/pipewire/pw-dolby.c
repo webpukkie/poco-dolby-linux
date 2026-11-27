@@ -11,10 +11,13 @@
  *   pw-link dolby_atmos:output_FL <sink-playback_FL>
  *   pw-link dolby_atmos:output_FR <sink-playback_FR>
  *
- * Format: s16 at the rate given with --rate (48 kHz by default, the engine's
- * native rate).  One port per channel, as PipeWire filters expect; the
- * interleaved block the DAP wants is assembled here.  Note the blocking
- * socket round-trip per block: this adds latency and is not RT-safe; for a
+ * Format: ports exchange f32 (the PipeWire graph's native format — pw_filter
+ * ports get no automatic converter, so offering s16 would make every link
+ * fail to negotiate); audio is converted to s16 for the DAP engine and back.
+ * One port per channel, as PipeWire filters expect; the interleaved block
+ * the DAP wants is assembled here, and arbitrary quantum sizes are buffered
+ * into engine-sized blocks by small FIFOs.  Note the blocking socket
+ * round-trip per block: this adds latency and is not RT-safe; for a
  * production node run dolbyd on arm64 natively (or port the libs to x86_64).
  */
 #include <errno.h>
@@ -43,8 +46,10 @@ struct impl {
     void *out_port[MAX_CH];
     int fd;
     uint32_t rate, ch, frames;
-    uint32_t block;         /* interleaved bytes per block */
-    uint8_t *scratch, *out; /* the DAP clobbers its input: process into scratch */
+    uint32_t block;         /* interleaved s16 bytes per engine block */
+    uint8_t *out;           /* daemon output staging (one block) */
+    uint8_t *fifo_in;  size_t fifo_in_cap, fifo_in_len, fifo_in_off;
+    uint8_t *fifo_out; size_t fifo_out_cap, fifo_out_len, fifo_out_off;
     unsigned long long blocks;
 };
 
@@ -94,6 +99,21 @@ static int daemon_process(struct impl *d, const uint8_t *in, uint8_t *out) {
     return (int)get32(rep);
 }
 
+static uint8_t *buf_grow(uint8_t *p, size_t need, size_t *cap) {
+    if (need <= *cap) return p;
+    size_t nc = *cap ? *cap : 8192;
+    while (nc < need) nc <<= 1;
+    uint8_t *np = realloc(p, nc);
+    if (np) *cap = nc;
+    return np;
+}
+
+static int16_t f2s(float x) {
+    if (x > 1.0f) return 32767;
+    if (x < -1.0f) return -32768;
+    return (int16_t)(x * 32767.0f);
+}
+
 static void on_process(void *userdata, struct spa_io_position *position) {
     struct impl *d = userdata;
     struct pw_buffer *in_b[MAX_CH] = { 0 }, *out_b[MAX_CH] = { 0 };
@@ -106,44 +126,80 @@ static void on_process(void *userdata, struct spa_io_position *position) {
         if (ok) { inb[c] = in_b[c]->buffer; outb[c] = out_b[c]->buffer; }
     }
 
-    uint32_t n_frames = d->frames;
-    if (ok) n_frames = inb[0]->datas[0].chunk->size / 2; /* s16 mono plane */
+    uint32_t n_frames = ok ? inb[0]->datas[0].chunk->size / 4 : 0; /* f32 mono plane */
 
-    if (ok && n_frames == d->frames) {
-        /* interleave the per-channel planes; the DAP clobbers its input,
-         * so it must process a scratch copy */
-        const int16_t *src[MAX_CH];
-        for (uint32_t c = 0; c < d->ch; c++)
-            src[c] = (const int16_t *)(inb[c]->datas[0].data + inb[c]->datas[0].chunk->offset);
-        int16_t *s = (int16_t *)d->scratch;
-        for (uint32_t i = 0; i < n_frames; i++)
-            for (uint32_t c = 0; c < d->ch; c++)
-                *s++ = src[c][i];
-
-        int rc = daemon_process(d, d->scratch, d->out);
-        if (rc == 0) {
-            const int16_t *o = (const int16_t *)d->out;
-            for (uint32_t c = 0; c < d->ch; c++) {
-                int16_t *dst = (int16_t *)outb[c]->datas[0].data;
-                for (uint32_t i = 0; i < n_frames; i++)
-                    dst[i] = o[i * d->ch + c];
-            }
-        } else {
-            fprintf(stderr, "dolby: process rc=%d, emitting silence\n", rc);
-            for (uint32_t c = 0; c < d->ch; c++)
-                memset(outb[c]->datas[0].data, 0, n_frames * 2);
+    if (ok && n_frames > 0) {
+        /* f32 planes -> interleaved s16, appended to the input FIFO */
+        size_t add = (size_t)n_frames * d->ch * 2;
+        uint8_t *fi = buf_grow(d->fifo_in, d->fifo_in_len + add, &d->fifo_in_cap);
+        if (!fi) ok = 0;
+        else {
+            int16_t *s = (int16_t *)(fi + d->fifo_in_len);
+            for (uint32_t i = 0; i < n_frames; i++)
+                for (uint32_t c = 0; c < d->ch; c++) {
+                    const float *src = (const float *)
+                        (inb[c]->datas[0].data + inb[c]->datas[0].chunk->offset);
+                    s[i * d->ch + c] = f2s(src[i]);
+                }
+            d->fifo_in = fi;
+            d->fifo_in_len += add;
         }
-        d->blocks++;
+    }
+    if (ok && n_frames > 0) {
+        /* push whole engine blocks through the DAP */
+        while (d->fifo_in_len - d->fifo_in_off >= d->block) {
+            int rc = daemon_process(d, d->fifo_in + d->fifo_in_off, d->out);
+            if (rc != 0) {
+                fprintf(stderr, "dolby: process rc=%d, emitting silence\n", rc);
+                d->fifo_in_off = d->fifo_in_len = 0;
+                ok = 0;
+                break;
+            }
+            uint8_t *fo = buf_grow(d->fifo_out, d->fifo_out_len + d->block, &d->fifo_out_cap);
+            if (!fo) { ok = 0; break; }
+            d->fifo_out = fo;
+            memcpy(d->fifo_out + d->fifo_out_len, d->out, d->block);
+            d->fifo_out_len += d->block;
+            d->fifo_in_off += d->block;
+            d->blocks++;
+        }
+        if (d->fifo_in_off) {
+            memmove(d->fifo_in, d->fifo_in + d->fifo_in_off, d->fifo_in_len - d->fifo_in_off);
+            d->fifo_in_len -= d->fifo_in_off;
+            d->fifo_in_off = 0;
+        }
+    }
+
+    uint32_t emit = 0;
+    if (ok && n_frames > 0) {
+        size_t avail = d->fifo_out_len - d->fifo_out_off;
+        emit = n_frames;
+        if (avail < (size_t)emit * d->ch * 2)
+            emit = (uint32_t)(avail / (d->ch * 2));
+        for (uint32_t c = 0; c < d->ch; c++) {
+            float *dst = (float *)outb[c]->datas[0].data;
+            const int16_t *o = (const int16_t *)(d->fifo_out + d->fifo_out_off);
+            for (uint32_t i = 0; i < emit; i++)
+                dst[i] = (float)o[i * d->ch + c] / 32768.0f;
+            for (uint32_t i = emit; i < n_frames; i++)
+                dst[i] = 0.0f;
+        }
+        d->fifo_out_off += (size_t)emit * d->ch * 2;
+        if (d->fifo_out_off) {
+            memmove(d->fifo_out, d->fifo_out + d->fifo_out_off, d->fifo_out_len - d->fifo_out_off);
+            d->fifo_out_len -= d->fifo_out_off;
+            d->fifo_out_off = 0;
+        }
     } else {
         for (uint32_t c = 0; c < d->ch; c++)
-            if (outb[c]) memset(outb[c]->datas[0].data, 0, n_frames * 2);
+            if (outb[c]) memset(outb[c]->datas[0].data, 0, n_frames * 4);
     }
 
     for (uint32_t c = 0; c < d->ch; c++) {
         if (outb[c]) {
             outb[c]->datas[0].chunk->offset = 0;
-            outb[c]->datas[0].chunk->size = n_frames * 2;
-            outb[c]->datas[0].chunk->stride = 2;
+            outb[c]->datas[0].chunk->size = n_frames * 4;
+            outb[c]->datas[0].chunk->stride = 4;
         }
         if (in_b[c]) pw_filter_queue_buffer(d->in_port[c], in_b[c]);
         if (out_b[c]) pw_filter_queue_buffer(d->out_port[c], out_b[c]);
@@ -171,7 +227,7 @@ static int add_channel_port(struct impl *d, enum pw_direction dir, uint32_t c) {
     struct spa_pod_builder b = SPA_POD_BUILDER_INIT(podbuf, sizeof(podbuf));
     const struct spa_pod *params[1];
     struct spa_audio_info_raw raw = SPA_AUDIO_INFO_RAW_INIT(
-        .format = SPA_AUDIO_FORMAT_S16,
+        .format = SPA_AUDIO_FORMAT_F32,
         .rate = d->rate,
         .channels = 1);
     raw.position[0] = (enum spa_audio_channel)(SPA_AUDIO_CHANNEL_START_Aux + 0);
@@ -216,9 +272,8 @@ int main(int argc, char **argv) {
     }
     if (impl.ch < 1 || impl.ch > MAX_CH) { fprintf(stderr, "channels must be 1..8\n"); return 2; }
     impl.block = (size_t)impl.frames * impl.ch * 2;
-    impl.scratch = malloc(impl.block);
     impl.out = malloc(impl.block);
-    if (!impl.scratch || !impl.out) return 1;
+    if (!impl.out) return 1;
 
     impl.fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (impl.fd < 0) { perror("socket"); return 1; }
